@@ -23,6 +23,8 @@ A professional AI image generation tool with **real-time progressive previews**,
 git clone https://github.com/YourUsername/AIImageGenerator.git
 cd AIImageGenerator
 
-#pip install --upgrade pip
+pip install --upgrade pip
 pip install -r requirements.txt
+python main.py
+
 
