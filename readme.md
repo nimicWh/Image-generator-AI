@@ -22,3 +22,7 @@ A professional AI image generation tool with **real-time progressive previews**,
 ```bash
 git clone https://github.com/YourUsername/AIImageGenerator.git
 cd AIImageGenerator
+
+#pip install --upgrade pip
+pip install -r requirements.txt
+
