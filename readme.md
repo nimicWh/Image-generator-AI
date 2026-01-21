@@ -15,6 +15,10 @@ A professional AI image generation tool with **real-time progressive previews**,
 - Export as PDF contact sheet with prompt text
 - Automatic best-image selection using CLIP
 
+## Python Version
+This project requires **Python 3.10 or 3.11**
+Python 3.12+ is not supported by PyTorch at this time.
+
 ## Installation
 
 1. **Clone the repository:**
@@ -26,5 +30,6 @@ cd AIImageGenerator
 pip install --upgrade pip
 pip install -r requirements.txt
 python main.py
+
 
 
