@@ -1,356 +1,178 @@
-import sys
-import os
+import sys, os
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton,
-    QVBoxLayout, QHBoxLayout, QSlider, QScrollArea, QGridLayout,
-    QFileDialog, QGroupBox, QFrame
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
+    QLabel, QFileDialog, QSlider, QInputDialog, QGridLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
-from PyQt6.QtGui import QPixmap, QImage, QDrag
+from PyQt6.QtCore import Qt
 from PIL import Image, ImageDraw, ImageFont
-import torch
 from diffusers import StableDiffusionPipeline
-from transformers import CLIPProcessor, CLIPModel
+import torch
 
-# --- Worker Thread for Progressive Generation ---
-class ProgressiveVariationsThread(QThread):
-    update_thumbnail = pyqtSignal(Image.Image, int)
-    finished = pyqtSignal(list)
+# Constants
+STYLE_COLORS = {"Art": (66, 135, 245), "Photo": (34, 177, 76),
+                "Cartoon": (255, 127, 39), "Anime": (163, 73, 164)}
+ICON_SIZE = (24, 24)
 
-    def __init__(self, pipe, prompt, width, height, steps, guidance, num_variations=4, callback_steps=5):
-        super().__init__()
-        self.pipe = pipe
-        self.prompt = prompt
-        self.width = width
-        self.height = height
-        self.steps = steps
-        self.guidance = guidance
-        self.num_variations = num_variations
-        self.callback_steps = callback_steps
-
-    def run(self):
-        images = [None] * self.num_variations
-
-        # generate all variations one by one (diffusers supports callback)
-        for idx in range(self.num_variations):
-            def callback(step, timestep, latents):
-                if step % self.callback_steps == 0:
-                    img = self.pipe.numpy_to_pil(latents)[0]
-                    self.update_thumbnail.emit(img, idx)
-
-            with torch.autocast("cuda") if torch.cuda.is_available() else torch.no_grad():
-                img = self.pipe(
-                    self.prompt,
-                    height=self.height,
-                    width=self.width,
-                    num_inference_steps=self.steps,
-                    guidance_scale=self.guidance,
-                    callback=callback,
-                    callback_steps=self.callback_steps
-                ).images[0]
-
-            images[idx] = img
-            self.update_thumbnail.emit(img, idx)
-
-        self.finished.emit(images)
-
-# --- Draggable Thumbnail Label ---
-class DraggableLabel(QLabel):
-    def __init__(self, image, index, parent=None):
-        super().__init__(parent)
-        self.image = image
-        self.index = index
-        self.setPixmap(AIImageGenerator.pil2pixmap(image).scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio))
-        self.setFrameShape(QFrame.Shape.Box)
-        self.setLineWidth(2)
-        self.setAcceptDrops(True)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            drag = QDrag(self)
-            mime_data = QMimeData()
-            mime_data.setText(str(self.index))
-            drag.setMimeData(mime_data)
-            drag.exec(Qt.DropAction.MoveAction)
-
-    def dragEnterEvent(self, event):
-        event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        source_index = int(event.mimeData().text())
-        target_index = self.index
-        self.parent().parent().reorder_images(source_index, target_index)
-        event.acceptProposedAction()
-
-# --- Main GUI ---
 class AIImageGenerator(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Image Generator Pro+ PDF Edition")
-        self.setGeometry(50, 50, 1000, 900)
-        self.pipe = None
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        self.prompt_history = []
-        self.history_index = -1
+        self.setWindowTitle("AI Image Generator Pro")
         self.generated_images = []
         self.thumbnail_labels = []
-        self.selected_image = None
-
+        self.image_styles = []
+        self.pipeline = self.load_pipeline()
+        self.load_icons()
         self.init_ui()
-        self.load_model()
+
+    def load_pipeline(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pipe = StableDiffusionPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16 if device=="cuda" else torch.float32
+        )
+        pipe.to(device)
+        return pipe
+
+    def load_icons(self):
+        self.icons = {}
+        for style in STYLE_COLORS.keys():
+            icon_path = os.path.join("icons", f"{style.lower()}.png")
+            if os.path.exists(icon_path):
+                self.icons[style] = Image.open(icon_path).convert("RGBA").resize(ICON_SIZE)
+            else:
+                self.icons[style] = None
 
     def init_ui(self):
         layout = QVBoxLayout()
-
-        # Prompt input
         self.prompt_input = QLineEdit()
-        layout.addWidget(QLabel("Enter your text prompt:"))
+        self.prompt_input.setPlaceholderText("Enter prompt here...")
         layout.addWidget(self.prompt_input)
 
-        # Undo/Redo Buttons
-        undo_redo_layout = QHBoxLayout()
-        undo_btn = QPushButton("Undo")
-        undo_btn.clicked.connect(self.undo_prompt)
-        redo_btn = QPushButton("Redo")
-        redo_btn.clicked.connect(self.redo_prompt)
-        undo_redo_layout.addWidget(undo_btn)
-        undo_redo_layout.addWidget(redo_btn)
-        layout.addLayout(undo_redo_layout)
-
-        # Style Presets
-        style_group = QGroupBox("Style Presets")
+        # Style buttons
         style_layout = QHBoxLayout()
-        self.styles = {
-            "Art": "digital painting, trending on artstation",
-            "Photo": "realistic photo, high detail",
-            "Cartoon": "cartoon style, vibrant colors",
-            "Anime": "anime style, colorful, detailed"
-        }
-        for name, style_prompt in self.styles.items():
-            btn = QPushButton(name)
-            btn.clicked.connect(lambda checked, s=style_prompt: self.apply_style(s))
+        for style in STYLE_COLORS.keys():
+            btn = QPushButton(style)
+            btn.clicked.connect(lambda _, s=style: self.generate_images(s))
             style_layout.addWidget(btn)
-        style_group.setLayout(style_layout)
-        layout.addWidget(style_group)
+        layout.addLayout(style_layout)
 
-        # Sliders
-        self.width_slider = self.create_slider("Width", 256, 1024, 512)
-        layout.addLayout(self.width_slider['layout'])
-        self.height_slider = self.create_slider("Height", 256, 1024, 512)
-        layout.addLayout(self.height_slider['layout'])
-        self.steps_slider = self.create_slider("Steps", 10, 100, 50)
-        layout.addLayout(self.steps_slider['layout'])
-        self.guidance_slider = self.create_slider("Guidance Scale", 1, 20, 7)
-        layout.addLayout(self.guidance_slider['layout'])
-
-        # Generate Button
-        self.generate_btn = QPushButton("Generate Variations")
-        self.generate_btn.clicked.connect(self.generate_variations)
-        layout.addWidget(self.generate_btn)
-
-        # Scrollable Thumbnail Grid
-        self.scroll_area = QScrollArea()
+        # Grid for thumbnails
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout()
         self.grid_widget.setLayout(self.grid_layout)
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setWidget(self.grid_widget)
-        layout.addWidget(self.scroll_area)
+        layout.addWidget(self.grid_widget)
 
-        # Full Image Display
-        self.image_label = QLabel()
-        self.image_label.setFixedSize(512, 512)
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.image_label)
-
-        # Save Buttons
-        save_layout = QHBoxLayout()
-        self.save_btn = QPushButton("Save Selected Image")
-        self.save_btn.clicked.connect(self.save_image)
-        self.save_all_btn = QPushButton("Save All Variations")
-        self.save_all_btn.clicked.connect(self.save_all_images)
-        self.save_pdf_btn = QPushButton("Export as PDF Contact Sheet")
-        self.save_pdf_btn.clicked.connect(self.export_pdf)
-        self.save_btn.setEnabled(False)
-        self.save_all_btn.setEnabled(False)
-        self.save_pdf_btn.setEnabled(False)
-        save_layout.addWidget(self.save_btn)
-        save_layout.addWidget(self.save_all_btn)
-        save_layout.addWidget(self.save_pdf_btn)
-        layout.addLayout(save_layout)
+        # Export button
+        export_btn = QPushButton("Export as PDF")
+        export_btn.clicked.connect(self.export_pdf)
+        layout.addWidget(export_btn)
 
         self.setLayout(layout)
 
-    def create_slider(self, label_text, min_val, max_val, default_val):
-        layout = QHBoxLayout()
-        label = QLabel(f"{label_text}: {default_val}")
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setMinimum(min_val)
-        slider.setMaximum(max_val)
-        slider.setValue(default_val)
-        slider.valueChanged.connect(lambda val, l=label, t=label_text: l.setText(f"{t}: {val}"))
-        layout.addWidget(QLabel(label_text))
-        layout.addWidget(slider)
-        layout.addWidget(label)
-        return {'layout': layout, 'slider': slider, 'label': label}
-
-    def apply_style(self, style_prompt):
-        current = self.prompt_input.text().strip()
-        self.prompt_input.setText(f"{style_prompt}, {current}" if current else style_prompt)
-
-    def undo_prompt(self):
-        if self.history_index > 0:
-            self.history_index -= 1
-            self.prompt_input.setText(self.prompt_history[self.history_index])
-
-    def redo_prompt(self):
-        if self.history_index < len(self.prompt_history) - 1:
-            self.history_index += 1
-            self.prompt_input.setText(self.prompt_history[self.history_index])
-
-    def load_model(self):
-        self.generate_btn.setEnabled(False)
-        QApplication.processEvents()
-        model_id = "runwayml/stable-diffusion-v1-5"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16 if device=="cuda" else torch.float32
-        )
-        self.pipe = self.pipe.to(device)
-        self.generate_btn.setEnabled(True)
-
-    def generate_variations(self):
-        prompt = self.prompt_input.text().strip()
+    def generate_images(self, style="Art"):
+        prompt = self.prompt_input.text()
         if not prompt:
             return
 
-        if not self.prompt_history or self.prompt_history[-1] != prompt:
-            self.prompt_history.append(prompt)
-            self.history_index = len(self.prompt_history) - 1
+        self.generated_images.clear()
+        self.image_styles.clear()
+        for i in range(4):  # 4 variations
+            img = self.pipeline(prompt, guidance_scale=7.5).images[0]
+            self.generated_images.append(img)
+            self.image_styles.append(style)
+            self.update_thumbnail(img, i, style)
 
-        width = self.width_slider['slider'].value()
-        height = self.height_slider['slider'].value()
-        steps = self.steps_slider['slider'].value()
-        guidance = self.guidance_slider['slider'].value()
-
-        self.generate_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
-        self.save_all_btn.setEnabled(False)
-        self.save_pdf_btn.setEnabled(False)
-        self.clear_grid()
-
-        self.thread = ProgressiveVariationsThread(
-            self.pipe, prompt, width, height, steps, guidance,
-            num_variations=4, callback_steps=5
-        )
-        self.thread.update_thumbnail.connect(self.update_thumbnail)
-        self.thread.finished.connect(self.select_best_image)
-        self.thread.start()
-
-    def clear_grid(self):
-        for i in reversed(range(self.grid_layout.count())):
-            widget = self.grid_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
-        self.generated_images = []
-        self.thumbnail_labels = []
-
-    def update_thumbnail(self, image, index):
-        if len(self.generated_images) <= index:
-            self.generated_images.append(image)
-        else:
-            self.generated_images[index] = image
+    def update_thumbnail(self, image, index, style="Art"):
+        img_with_number = image.copy()
+        draw = ImageDraw.Draw(img_with_number)
+        # Number overlay
+        number_color = STYLE_COLORS.get(style, (255,255,255))
+        rect_color = tuple(c//2 for c in number_color)
+        rect_size = 30
+        draw.rectangle([5,5,5+rect_size,5+rect_size], fill=rect_color+(200,))
+        draw.text((10,5), f"#{index+1}", fill=number_color, font=ImageFont.load_default())
+        # Style icon
+        icon = self.icons.get(style)
+        if icon: img_with_number.paste(icon, (img_with_number.width-ICON_SIZE[0]-5,5), mask=icon)
 
         if len(self.thumbnail_labels) <= index:
-            label = DraggableLabel(image, index, parent=self.grid_widget)
-            label.mousePressEvent = lambda e, img=image: self.show_full_image(img)
+            label = QLabel()
+            label.setPixmap(self.pil2pixmap(img_with_number).scaled(128,128,Qt.AspectRatioMode.KeepAspectRatio))
             self.thumbnail_labels.append(label)
-            self.grid_layout.addWidget(label, index // 2, index % 2)
+            self.grid_layout.addWidget(label, index//2, index%2)
         else:
-            self.thumbnail_labels[index].setPixmap(AIImageGenerator.pil2pixmap(image).scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio))
-
-    def show_full_image(self, image):
-        image.thumbnail((512, 512))
-        self.image_label.setPixmap(AIImageGenerator.pil2pixmap(image))
-        self.selected_image = image
-        self.save_btn.setEnabled(True)
-
-    def select_best_image(self, images):
-        if not images:
-            self.generate_btn.setEnabled(True)
-            return
-        prompt = self.prompt_input.text().strip()
-        inputs = self.clip_processor(text=[prompt]*len(images), images=images, return_tensors="pt", padding=True)
-        outputs = self.clip_model(**inputs)
-        best_idx = outputs.logits_per_image.argmax().item()
-        self.show_full_image(images[best_idx])
-        self.save_all_btn.setEnabled(True)
-        self.save_pdf_btn.setEnabled(True)
-        self.generate_btn.setEnabled(True)
-
-    def reorder_images(self, source_index, target_index):
-        # Swap images
-        self.generated_images[source_index], self.generated_images[target_index] = self.generated_images[target_index], self.generated_images[source_index]
-        # Swap thumbnails
-        self.thumbnail_labels[source_index], self.thumbnail_labels[target_index] = self.thumbnail_labels[target_index], self.thumbnail_labels[source_index]
-        # Update grid
-        for idx, label in enumerate(self.thumbnail_labels):
-            self.grid_layout.addWidget(label, idx // 2, idx % 2)
-            label.index = idx
-
-    def save_image(self):
-        if self.selected_image:
-            path, _ = QFileDialog.getSaveFileName(self, "Save Image", "", "PNG Files (*.png);;JPEG Files (*.jpg)")
-            if path:
-                self.selected_image.save(path)
-
-    def save_all_images(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Save All Images")
-        if folder:
-            for i, img in enumerate(self.generated_images):
-                img.save(os.path.join(folder, f"variation_{i+1}.png"))
-
-    def export_pdf(self):
-        if not self.generated_images:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save PDF Contact Sheet", "", "PDF Files (*.pdf)")
-        if not path:
-            return
-
-        # Create contact sheet (2x2)
-        thumb_size = 512
-        padding = 20
-        font = ImageFont.load_default()
-        num_images = len(self.generated_images)
-        sheet_width = 2 * (thumb_size + padding) + padding
-        sheet_height = 2 * (thumb_size + padding + 20) + padding  # extra 20 for prompt text
-
-        sheet = Image.new("RGB", (sheet_width, sheet_height), (255, 255, 255))
-        for idx, img in enumerate(self.generated_images):
-            x = padding + (idx % 2) * (thumb_size + padding)
-            y = padding + (idx // 2) * (thumb_size + padding + 20)
-            temp = img.copy()
-            temp.thumbnail((thumb_size, thumb_size))
-            sheet.paste(temp, (x, y))
-            draw = ImageDraw.Draw(sheet)
-            prompt_text = self.prompt_input.text()
-            draw.text((x, y + temp.height + 2), prompt_text, fill=(0, 0, 0), font=font)
-
-        sheet.save(path)
+            self.thumbnail_labels[index].setPixmap(self.pil2pixmap(img_with_number).scaled(128,128,Qt.AspectRatioMode.KeepAspectRatio))
 
     @staticmethod
-    def pil2pixmap(image):
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        data = image.tobytes("raw", "RGBA")
-        qimage = QImage(data, image.width, image.height, QImage.Format.Format_RGBA8888)
-        return QPixmap.fromImage(qimage)
+    def pil2pixmap(img):
+        from PyQt6.QtGui import QPixmap, ImageQt
+        return QPixmap.fromImage(ImageQt.ImageQt(img))
 
+    def export_pdf(self):
+        if not self.generated_images: return
+        path,_ = QFileDialog.getSaveFileName(self,"Save PDF","","PDF Files (*.pdf)")
+        if not path: return
 
-# --- Run App ---
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = AIImageGenerator()
-    window.show()
+        rows, ok1 = QInputDialog.getInt(self,"Grid Rows","Rows per page:",2,1,10)
+        if not ok1: return
+        cols, ok2 = QInputDialog.getInt(self,"Grid Columns","Columns per page:",2,1,10)
+        if not ok2: return
+
+        thumb_size = 512
+        padding = 20
+        text_space = 30
+        legend_height = 40
+        try: font_path = os.path.join("fonts","arial.ttf"); font=ImageFont.truetype(font_path,16)
+        except: font=ImageFont.load_default()
+
+        images_per_page = rows*cols
+        pages = (len(self.generated_images)+images_per_page-1)//images_per_page
+        pdf_pages = []
+        page_width = cols*(thumb_size+padding)+padding
+        page_height = rows*(thumb_size+padding+text_space)+padding+legend_height
+
+        for page_num in range(pages):
+            page_image = Image.new("RGB",(page_width,page_height),(255,255,255))
+            for i in range(images_per_page):
+                idx = page_num*images_per_page+i
+                if idx>=len(self.generated_images): break
+                img=self.generated_images[idx].copy(); style=self.image_styles[idx]; draw_img=ImageDraw.Draw(img)
+                # Number overlay
+                number_color=STYLE_COLORS.get(style,(255,255,255))
+                rect_color=tuple(c//2 for c in number_color)
+                rect_size=30
+                draw_img.rectangle([5,5,5+rect_size,5+rect_size], fill=rect_color+(200,))
+                draw_img.text((10,5), f"#{idx+1}", fill=number_color, font=font)
+                # Style icon
+                icon=self.icons.get(style)
+                if icon: img.paste(icon, (img.width-ICON_SIZE[0]-5,5), mask=icon)
+
+                # Paste thumbnail
+                col=i%cols; row=i//cols
+                x=padding+col*(thumb_size+padding); y=padding+row*(thumb_size+padding+text_space)
+                page_image.paste(img,(x,y))
+
+                # Prompt text
+                draw_page=ImageDraw.Draw(page_image)
+                prompt_text=self.prompt_input.text()
+                text_width,_ = draw_page.textsize(prompt_text,font=font)
+                text_x=x+(thumb_size-text_width)//2
+                text_y=y+img.height+2
+                draw_page.text((text_x,text_y), prompt_text, fill=(0,0,0), font=font)
+
+            # Draw legend
+            legend_y = page_height - legend_height + 5
+            legend_x = padding; box_size=20; spacing=10
+            for style_name,color in STYLE_COLORS.items():
+                draw_page.rectangle([legend_x,legend_y,legend_x+box_size,legend_y+box_size],fill=color)
+                draw_page.text((legend_x+box_size+5,legend_y), style_name, fill=(0,0,0), font=font)
+                legend_x += box_size + 5 + draw_page.textsize(style_name,font=font)[0] + spacing
+
+            pdf_pages.append(page_image)
+
+        pdf_pages[0].save(path, save_all=True, append_images=pdf_pages[1:])
+
+if __name__=="__main__":
+    app=QApplication(sys.argv)
+    win=AIImageGenerator()
+    win.show()
     sys.exit(app.exec())
