@@ -1,10 +1,11 @@
 import sys, os
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
-    QLabel, QFileDialog, QSlider, QInputDialog, QGridLayout
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLineEdit, QLabel, QFileDialog, QInputDialog, QGridLayout
 )
 from PyQt6.QtCore import Qt
-from PIL import Image, ImageDraw, ImageFont
+from PyQt6.QtGui import QPixmap
+from PIL import Image, ImageDraw, ImageFont, ImageQt
 from diffusers import StableDiffusionPipeline
 import torch
 
@@ -12,6 +13,7 @@ import torch
 STYLE_COLORS = {"Art": (66, 135, 245), "Photo": (34, 177, 76),
                 "Cartoon": (255, 127, 39), "Anime": (163, 73, 164)}
 ICON_SIZE = (24, 24)
+VARIATIONS = 4  # Number of variations per prompt
 
 class AIImageGenerator(QWidget):
     def __init__(self):
@@ -20,14 +22,22 @@ class AIImageGenerator(QWidget):
         self.generated_images = []
         self.thumbnail_labels = []
         self.image_styles = []
+
+        # Undo/Redo
+        self.prompt_history = []
+        self.style_history = []
+        self.history_index = -1
+
         self.pipeline = self.load_pipeline()
         self.load_icons()
         self.init_ui()
 
+    # ---------------- Pipeline & Icons ----------------
     def load_pipeline(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         pipe = StableDiffusionPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16 if device=="cuda" else torch.float32
+            "runwayml/stable-diffusion-v1-5",
+            torch_dtype=torch.float16 if device=="cuda" else torch.float32
         )
         pipe.to(device)
         return pipe
@@ -35,14 +45,17 @@ class AIImageGenerator(QWidget):
     def load_icons(self):
         self.icons = {}
         for style in STYLE_COLORS.keys():
-            icon_path = os.path.join("icons", f"{style.lower()}.png")
-            if os.path.exists(icon_path):
-                self.icons[style] = Image.open(icon_path).convert("RGBA").resize(ICON_SIZE)
+            path = os.path.join("icons", f"{style.lower()}.png")
+            if os.path.exists(path):
+                self.icons[style] = Image.open(path).convert("RGBA").resize(ICON_SIZE)
             else:
                 self.icons[style] = None
 
+    # ---------------- GUI ----------------
     def init_ui(self):
         layout = QVBoxLayout()
+
+        # Prompt input
         self.prompt_input = QLineEdit()
         self.prompt_input.setPlaceholderText("Enter prompt here...")
         layout.addWidget(self.prompt_input)
@@ -55,7 +68,17 @@ class AIImageGenerator(QWidget):
             style_layout.addWidget(btn)
         layout.addLayout(style_layout)
 
-        # Grid for thumbnails
+        # Undo/Redo buttons
+        history_layout = QHBoxLayout()
+        undo_btn = QPushButton("Undo")
+        undo_btn.clicked.connect(self.undo)
+        redo_btn = QPushButton("Redo")
+        redo_btn.clicked.connect(self.redo)
+        history_layout.addWidget(undo_btn)
+        history_layout.addWidget(redo_btn)
+        layout.addLayout(history_layout)
+
+        # Thumbnail grid
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout()
         self.grid_widget.setLayout(self.grid_layout)
@@ -68,32 +91,51 @@ class AIImageGenerator(QWidget):
 
         self.setLayout(layout)
 
+    # ---------------- Generate Images ----------------
     def generate_images(self, style="Art"):
         prompt = self.prompt_input.text()
         if not prompt:
             return
 
+        # Truncate redo history if new prompt after undo
+        if self.history_index < len(self.prompt_history) - 1:
+            self.prompt_history = self.prompt_history[:self.history_index+1]
+            self.style_history = self.style_history[:self.history_index+1]
+
+        # Add to history
+        self.prompt_history.append(prompt)
+        self.style_history.append(style)
+        self.history_index += 1
+
+        # Generate images
+        self._regenerate_from_history(prompt, style)
+
+    def _regenerate_from_history(self, prompt, style):
         self.generated_images.clear()
         self.image_styles.clear()
-        for i in range(4):  # 4 variations
+        for i in range(VARIATIONS):
             img = self.pipeline(prompt, guidance_scale=7.5).images[0]
             self.generated_images.append(img)
             self.image_styles.append(style)
             self.update_thumbnail(img, i, style)
 
+    # ---------------- Thumbnails ----------------
     def update_thumbnail(self, image, index, style="Art"):
         img_with_number = image.copy()
         draw = ImageDraw.Draw(img_with_number)
-        # Number overlay
-        number_color = STYLE_COLORS.get(style, (255,255,255))
+
+        # Number
+        number_color = STYLE_COLORS.get(style,(255,255,255))
         rect_color = tuple(c//2 for c in number_color)
         rect_size = 30
         draw.rectangle([5,5,5+rect_size,5+rect_size], fill=rect_color+(200,))
         draw.text((10,5), f"#{index+1}", fill=number_color, font=ImageFont.load_default())
+
         # Style icon
         icon = self.icons.get(style)
         if icon: img_with_number.paste(icon, (img_with_number.width-ICON_SIZE[0]-5,5), mask=icon)
 
+        # Update grid
         if len(self.thumbnail_labels) <= index:
             label = QLabel()
             label.setPixmap(self.pil2pixmap(img_with_number).scaled(128,128,Qt.AspectRatioMode.KeepAspectRatio))
@@ -104,9 +146,28 @@ class AIImageGenerator(QWidget):
 
     @staticmethod
     def pil2pixmap(img):
-        from PyQt6.QtGui import QPixmap, ImageQt
         return QPixmap.fromImage(ImageQt.ImageQt(img))
 
+    # ---------------- Undo/Redo ----------------
+    def undo(self):
+        if self.history_index <= 0:
+            return
+        self.history_index -= 1
+        prompt = self.prompt_history[self.history_index]
+        style = self.style_history[self.history_index]
+        self.prompt_input.setText(prompt)
+        self._regenerate_from_history(prompt, style)
+
+    def redo(self):
+        if self.history_index >= len(self.prompt_history) - 1:
+            return
+        self.history_index += 1
+        prompt = self.prompt_history[self.history_index]
+        style = self.style_history[self.history_index]
+        self.prompt_input.setText(prompt)
+        self._regenerate_from_history(prompt, style)
+
+    # ---------------- PDF Export ----------------
     def export_pdf(self):
         if not self.generated_images: return
         path,_ = QFileDialog.getSaveFileName(self,"Save PDF","","PDF Files (*.pdf)")
@@ -145,12 +206,10 @@ class AIImageGenerator(QWidget):
                 # Style icon
                 icon=self.icons.get(style)
                 if icon: img.paste(icon, (img.width-ICON_SIZE[0]-5,5), mask=icon)
-
                 # Paste thumbnail
                 col=i%cols; row=i//cols
                 x=padding+col*(thumb_size+padding); y=padding+row*(thumb_size+padding+text_space)
                 page_image.paste(img,(x,y))
-
                 # Prompt text
                 draw_page=ImageDraw.Draw(page_image)
                 prompt_text=self.prompt_input.text()
@@ -158,19 +217,17 @@ class AIImageGenerator(QWidget):
                 text_x=x+(thumb_size-text_width)//2
                 text_y=y+img.height+2
                 draw_page.text((text_x,text_y), prompt_text, fill=(0,0,0), font=font)
-
-            # Draw legend
+            # Legend
             legend_y = page_height - legend_height + 5
             legend_x = padding; box_size=20; spacing=10
             for style_name,color in STYLE_COLORS.items():
                 draw_page.rectangle([legend_x,legend_y,legend_x+box_size,legend_y+box_size],fill=color)
                 draw_page.text((legend_x+box_size+5,legend_y), style_name, fill=(0,0,0), font=font)
                 legend_x += box_size + 5 + draw_page.textsize(style_name,font=font)[0] + spacing
-
             pdf_pages.append(page_image)
-
         pdf_pages[0].save(path, save_all=True, append_images=pdf_pages[1:])
 
+# ---------------- Main ----------------
 if __name__=="__main__":
     app=QApplication(sys.argv)
     win=AIImageGenerator()
